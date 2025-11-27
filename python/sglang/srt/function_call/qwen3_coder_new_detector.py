@@ -418,25 +418,418 @@ class StreamingXMLToolCallParser:
         """
         Process complete XML elements in the buffer
 
-        NOTE: Full implementation will be added in PR2
+        Returns:
+            bool: whether complete elements were found and processed
         """
-        raise NotImplementedError("Will be implemented in PR2")
+        found_any = False
+
+        while self.last_processed_pos < len(self.streaming_buffer):
+            # Find next complete element
+            element, end_pos = self._find_next_complete_element(self.last_processed_pos)
+            if element is None:
+                # No complete element found, wait for more data
+                break
+
+            # Check if this element should be skipped
+            if self._should_skip_element(element):
+                # print(f"Skip non-XML text: {repr(element)}")
+                self.last_processed_pos = end_pos
+                continue
+
+            # Found complete XML element, process it
+            try:
+                # Preprocess XML chunk
+                preprocessed_element = self._preprocess_xml_chunk(element)
+                # Check if this is the first tool_call start
+                if (
+                    preprocessed_element.strip().startswith("<tool_call>")
+                    and self.tool_call_index == 0
+                ):
+                    # First tool_call starts, output previously collected text content first
+                    if self.text_content_buffer:
+                        text_delta = DeltaMessage(
+                            role=None,
+                            content=self.text_content_buffer,
+                            reasoning_content=None,
+                            tool_calls=[],
+                        )
+                        self._emit_delta(text_delta)
+                        # Clear buffer for potential subsequent text content
+                        self.text_content_buffer = ""
+
+                # Check if this is a new tool_call start and there's already a completed tool_call
+                if (
+                    preprocessed_element.strip().startswith("<tool_call>")
+                    and self.tool_call_index > 0
+                ):
+                    self._reset_parser_for_new_tool_call()
+
+                # Parse preprocessed element
+                self.parser.Parse(preprocessed_element, False)
+                found_any = True
+
+            except Exception as e:
+                logger.warning(
+                    f"exception occurs: {e}, preprocessed_element: {repr(element)}"
+                )
+
+            # Update processed position
+            self.last_processed_pos = end_pos
+
+        return found_any
 
     def _find_next_complete_element(self, start_pos: int) -> Tuple[Optional[str], int]:
         """
         Find the next complete XML element from specified position
 
-        NOTE: Full implementation will be added in PR2
+        Args:
+            start_pos: start position for search
+
+        Returns:
+            (complete element string, element end position), returns (None, start_pos) if no complete element found
         """
-        raise NotImplementedError("Will be implemented in PR2")
+        buffer = self.streaming_buffer[start_pos:]
+
+        if not buffer:
+            return None, start_pos
+
+        # Find XML tags
+        if buffer.startswith("<"):
+            # Need to ensure no new < appears, find the closest one between < and >
+            tag_end = buffer.find("<", 1)
+            tag_end2 = buffer.find(">", 1)
+            if tag_end != -1 and tag_end2 != -1:
+                # Next closest is <
+                if tag_end < tag_end2:
+                    return buffer[:tag_end], start_pos + tag_end
+                # Next closest is >, found XML element
+                else:
+                    return buffer[: tag_end2 + 1], start_pos + tag_end2 + 1
+            elif tag_end != -1:
+                return buffer[:tag_end], start_pos + tag_end
+            elif tag_end2 != -1:
+                return buffer[: tag_end2 + 1], start_pos + tag_end2 + 1
+            else:
+                # If currently not parsing tool call (entering a tool_call), check if it starts with <tool_call>
+                if self.current_call_id is None:
+                    # Match <tool_call> according to buffer length
+                    tool_call_prefix = "<tool_call>"
+                    if len(buffer) >= len(tool_call_prefix):
+                        # Buffer length is sufficient, check if it matches <tool_call
+                        if buffer.startswith(tool_call_prefix):
+                            # Matched, wait for more data
+                            return None, start_pos
+                        else:
+                            # Didn't match, treat as text
+                            return buffer, start_pos + len(buffer)
+                    else:
+                        # Buffer length insufficient, check if it might be the beginning of <tool_call>
+                        if buffer == "<tool_call>"[: len(buffer)]:
+                            # Might be the beginning of <tool_call>, wait for more data
+                            return None, start_pos
+                        else:
+                            # Not the beginning of <tool_call>, treat as text
+                            return buffer, start_pos + len(buffer)
+                else:
+                    # When parsing tool call, wait for more data to get complete tag
+                    return None, start_pos
+        else:
+            # Find text content (until next < or end of buffer)
+            next_tag_pos = buffer.find("<")
+            if next_tag_pos != -1:
+                # Found text content
+                text_content = buffer[:next_tag_pos]
+                if text_content.strip():  # Only process non-empty text
+                    return text_content, start_pos + next_tag_pos
+                else:
+                    # Skip empty content
+                    return text_content, start_pos + next_tag_pos
+            else:
+                # End of buffer is all text, process immediately (no longer wait for more data)
+                remaining = buffer
+                if remaining.strip():  # Has actual content
+                    return remaining, start_pos + len(remaining)
+                else:
+                    # Empty content, skip
+                    return remaining, start_pos + len(remaining)
 
     def _merge_new_deltas_to_single_response(self, initial_count: int) -> DeltaMessage:
         """
         Merge newly generated deltas in this processing into single DeltaMessage
 
-        NOTE: Full implementation will be added in PR2
+        Args:
+            initial_count: number of deltas before processing
+
+        Returns:
+            merged DeltaMessage containing all newly generated delta information
         """
-        raise NotImplementedError("Will be implemented in PR2")
+        if len(self.deltas) <= initial_count:
+            return DeltaMessage(
+                role=None, content=None, reasoning_content=None, tool_calls=[]
+            )
+
+        # Get newly generated deltas
+        new_deltas = self.deltas[initial_count:]
+
+        if len(new_deltas) == 1:
+            # Only one new delta, return directly
+            return new_deltas[0]
+
+        # Merge multiple new deltas
+        merged_tool_calls = []
+        merged_content = ""
+        merged_reasoning_content = ""
+        merged_role = None
+
+        for delta in new_deltas:
+            if delta.role:
+                merged_role = delta.role
+            if delta.content:
+                merged_content += delta.content
+            if delta.reasoning_content:
+                merged_reasoning_content += delta.reasoning_content
+            if delta.tool_calls:
+                # For tool_calls, we need to intelligently merge arguments
+                for tool_call in delta.tool_calls:
+                    # Check if there's already a tool_call with the same call_id
+
+                    existing_call = None
+                    for existing in merged_tool_calls:
+                        if existing.id == tool_call.id:
+                            existing_call = existing
+                            break
+
+                    if existing_call:
+                        # Merge into existing tool_call
+                        if tool_call.function and tool_call.function.name:
+                            existing_call.function.name = tool_call.function.name
+                        if (
+                            tool_call.function
+                            and tool_call.function.arguments is not None
+                        ):
+                            if existing_call.function.arguments is None:
+                                existing_call.function.arguments = ""
+
+                            # For streaming JSON parameters, simply concatenate in order
+                            new_args = tool_call.function.arguments
+                            existing_call.function.arguments += new_args
+                        if tool_call.type:
+                            existing_call.type = tool_call.type
+                    else:
+                        # Add new tool_call
+                        merged_tool_calls.append(tool_call)
+
+        return DeltaMessage(
+            role=merged_role,
+            content=merged_content if merged_content else None,
+            reasoning_content=(
+                merged_reasoning_content if merged_reasoning_content else None
+            ),
+            tool_calls=merged_tool_calls,
+        )
+
+    def _merge_new_deltas(self, deltas: List[DeltaMessage]) -> DeltaMessage:
+        """
+        Merge DeltaMessage array into single DeltaMessage
+
+        Args:
+            deltas: list of DeltaMessage to merge
+
+        Returns:
+            merged DeltaMessage containing information from all input deltas
+        """
+        if not deltas:
+            return DeltaMessage(
+                role=None, content=None, reasoning_content=None, tool_calls=[]
+            )
+
+        # Filter out empty deltas (tool_calls empty or None)
+        valid_deltas = [
+            delta for delta in deltas if delta is not None and delta.tool_calls
+        ]
+        if not valid_deltas:
+            return DeltaMessage(
+                role=None, content=None, reasoning_content=None, tool_calls=[]
+            )
+
+        # Collect all content and reasoning_content
+        merged_content = ""
+        merged_reasoning_content = ""
+        merged_role = None
+
+        for delta in deltas:
+            if delta:
+                if delta.role:
+                    merged_role = delta.role
+                if delta.content:
+                    merged_content += delta.content
+                if delta.reasoning_content:
+                    merged_reasoning_content += delta.reasoning_content
+
+        # Merge all tool_calls
+        merged_tool_calls = []
+        merged_tool_calls_index = []
+        for delta in valid_deltas:
+            for tool_call in delta.tool_calls:
+                if tool_call.index not in merged_tool_calls_index:
+                    merged_tool_calls.append(tool_call)
+                    merged_tool_calls_index.append(tool_call.index)
+                else:
+                    if tool_call.function and tool_call.function.arguments is not None:
+                        merged_tool_calls[
+                            merged_tool_calls_index.index(tool_call.index)
+                        ].function.arguments += tool_call.function.arguments
+
+        if not merged_tool_calls:
+            return DeltaMessage(
+                role=merged_role,
+                content=merged_content or None,
+                reasoning_content=merged_reasoning_content or None,
+                tool_calls=[],
+            )
+
+        return DeltaMessage(
+            role=merged_role,
+            content=merged_content if merged_content else None,
+            reasoning_content=(
+                merged_reasoning_content if merged_reasoning_content else None
+            ),
+            tool_calls=merged_tool_calls,
+        )
+
+    def _parse_incremental_xml(self, new_content: str) -> List[DeltaMessage]:
+        """
+        Incrementally parse XML content
+
+        Args:
+            new_content: newly added text content
+
+        Returns:
+            list of DeltaMessage
+        """
+        if not new_content.strip():
+            return []
+
+        # Clear previous deltas, only return new ones
+        previous_deltas_count = len(self.deltas)
+
+        # Check if there are complete XML tags to parse
+        xml_chunks = self._extract_complete_xml_chunks(new_content)
+
+        if not xml_chunks:
+            return []
+
+        try:
+            # Preprocess and parse complete XML chunks
+            for chunk in xml_chunks:
+                if chunk.strip():
+                    # Preprocess non-standard format
+                    processed_chunk = self._preprocess_xml_chunk(chunk)
+                    self.parser.Parse(processed_chunk, False)
+
+            # Return newly generated deltas
+            new_deltas = self.deltas[previous_deltas_count:]
+            return new_deltas
+
+        except Exception as e:
+            logger.warning(f"exception occurred in _parse_incremental_xml: {e}")
+            return []
+
+    def _extract_complete_xml_chunks(self, new_content: str) -> List[str]:
+        """
+        Extract complete XML chunks from new content
+
+        Args:
+            new_content: newly added text content
+
+        Returns:
+            list of complete XML chunks
+        """
+        chunks = []
+        buffer = new_content
+
+        # Find complete XML tags
+        i = 0
+        while i < len(buffer):
+            if buffer[i] == "<":
+                # Find tag end
+                tag_end = buffer.find(">", i)
+                if tag_end != -1:
+                    # Found complete tag
+                    tag = buffer[i : tag_end + 1]
+                    chunks.append(tag)
+                    i = tag_end + 1
+                else:
+                    # Tag incomplete, stop processing
+                    break
+            else:
+                # Find next < or accumulate text content
+                next_tag = buffer.find("<", i)
+                if next_tag != -1:
+                    # Have text content
+                    text_content = buffer[i:next_tag]
+                    if text_content.strip():
+                        chunks.append(text_content)
+                    i = next_tag
+                else:
+                    # Remaining is all text content
+                    remaining = buffer[i:]
+                    if remaining.strip():
+                        chunks.append(remaining)
+                    break
+
+        return chunks
+
+    def _convert_to_delta_message(
+        self, delta_responses: List[DeltaMessage]
+    ) -> DeltaMessage:
+        """
+        Convert DeltaMessage list to DeltaMessage
+
+        Args:
+            delta_responses: DeltaMessage list
+
+        Returns:
+            DeltaMessage object
+        """
+        if not delta_responses:
+            return DeltaMessage()
+
+        # Merge content from all deltas
+        merged_tool_calls = []
+        merged_content = ""
+        merged_reasoning_content = ""
+        merged_role = None
+
+        for delta in delta_responses:
+            if delta.role:
+                merged_role = delta.role
+            if delta.content:
+                merged_content += delta.content
+            if delta.reasoning_content:
+                merged_reasoning_content += delta.reasoning_content
+            if delta.tool_calls:
+                merged_tool_calls.extend(delta.tool_calls)
+
+        return DeltaMessage(
+            role=merged_role,
+            content=merged_content if merged_content else None,
+            reasoning_content=(
+                merged_reasoning_content if merged_reasoning_content else None
+            ),
+            tool_calls=merged_tool_calls,
+        )
+
+    # ========== Placeholder methods for PR3 ==========
+    # These will be implemented in PR3
+
+    def _reset_parser_for_new_tool_call(self):
+        """
+        Reset parser state for new tool_call (but keep generated deltas)
+
+        NOTE: Full implementation will be added in PR3
+        """
+        raise NotImplementedError("Will be implemented in PR3")
 
     def _start_element(self, name: str, attrs: Dict[str, str]):
         """
